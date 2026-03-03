@@ -1,5 +1,7 @@
 # Email for Claude Desktop, Cursor & Windsurf
 
+<!-- mcp-name: io.github.shanjai-raj/commune-mcp -->
+
 [![PyPI](https://img.shields.io/pypi/v/commune-mcp?color=blue&label=PyPI)](https://pypi.org/project/commune-mcp/)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/commune-mcp?label=installs%2Fmo)](https://pypi.org/project/commune-mcp/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://pypi.org/project/commune-mcp/)
