@@ -25,7 +25,7 @@ import contextvars
 import json
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -49,7 +49,8 @@ mcp = FastMCP(
     "Commune",
     instructions=(
         "Email infrastructure for agents — set up an inbox and send your first email in 30 seconds. "
-        "Programmatic inboxes (~1 line), consistent threads, custom domains, attachments, and structured data."
+        "Programmatic inboxes (~1 line), consistent threads, custom domains, attachments, and structured data. "
+        "Use submit_feedback to report errors, request missing capabilities, or send observations back to the product team."
     ),
 )
 
@@ -981,6 +982,57 @@ def credits_checkout(bundle: str, return_url: Optional[str] = None) -> str:
     if return_url:
         payload["return_url"] = return_url
     return _fmt(_post("/v1/credits/checkout", payload))
+
+
+# ─── Feedback ────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def submit_feedback(
+    type: Literal["error", "feature", "signal"],
+    message: str,
+    context: Optional[dict[str, Any]] = None,
+) -> str:
+    """Submit feedback about Commune to the product team.
+
+    Use this tool whenever you encounter something worth reporting — an error,
+    a missing capability, or an observation about what's working well or could
+    be improved.
+
+    Three feedback types:
+
+      "error"   — the API returned a non-2xx status, the response shape was
+                  wrong, or behavior was incorrect (not just unexpected).
+                  Include context: which tool you called, what you expected,
+                  what happened. Example: "list_threads returns 500 when the
+                  inbox has never received a message."
+
+      "feature" — you need a capability that doesn't exist yet.
+                  Be specific about the use case. Example: "Need cursor-based
+                  pagination on search_threads — current limit cap blocks
+                  processing large backlogs."
+
+      "signal"  — the API succeeded but quality, latency, or behavior was
+                  unexpected. Also use for positive observations.
+                  Example: "Semantic search quality on long threads is
+                  excellent — intent matching across 40+ messages works."
+                  Example: "Thread metadata endpoint is slow (~3s) on inboxes
+                  with 1000+ threads — expected <500ms."
+
+    The optional context dict lets you attach structured metadata that makes
+    feedback actionable. For errors, include the tool name, any IDs, and
+    status codes. For features, include the related tool and your use case.
+
+    Args:
+        type: Feedback type — "error", "feature", or "signal"
+        message: Clear description of the feedback (max 4000 chars)
+        context: Optional structured metadata, e.g.
+                 {"tool": "list_threads", "inbox_id": "inb_123", "status_code": 500}
+    """
+    payload: dict[str, Any] = {"type": type, "message": message}
+    if context:
+        payload["context"] = context
+    return _fmt(_post("/v1/feedback", payload))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
