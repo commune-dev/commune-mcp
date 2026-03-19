@@ -52,8 +52,7 @@ _api_key_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "commune_api_key", default=os.environ.get("COMMUNE_API_KEY", "")
 )
 
-# x402 wallet key — alternative to API key (pay-per-call with USDC)
-_wallet_key: str = os.environ.get("COMMUNE_WALLET_KEY", "")
+# x402 client — set programmatically or via x402's own env-based setup
 _x402_client: Any = None
 
 BASE_URL = os.environ.get(
@@ -61,31 +60,19 @@ BASE_URL = os.environ.get(
 ).rstrip("/")
 
 
-def _init_x402() -> Any:
-    """Lazily initialize the x402 client from COMMUNE_WALLET_KEY."""
-    global _x402_client
-    if _x402_client is not None:
-        return _x402_client
-    if not _wallet_key:
-        return None
-    try:
-        from x402 import x402Client
-        from x402.mechanisms.evm.exact import ExactEvmScheme
-        from eth_account import Account
+def set_x402_client(client: Any) -> None:
+    """Set a pre-configured x402 client for wallet-based payments.
 
-        key = _wallet_key if _wallet_key.startswith("0x") else f"0x{_wallet_key}"
-        signer = Account.from_key(key)
-        _x402_client = x402Client()
-        _x402_client.register("eip155:*", ExactEvmScheme(signer=signer))
-        return _x402_client
-    except ImportError:
-        print(
-            "Warning: COMMUNE_WALLET_KEY is set but x402 dependencies are missing.\n"
-            "  Install them: pip install x402[evm] eth_account\n"
-            "  Falling back to API key auth (will fail if COMMUNE_API_KEY is not set).",
-            file=sys.stderr,
-        )
-        return None
+    The caller creates and owns the x402Client — we never touch private keys.
+    Call this before starting the MCP server if using x402 mode.
+    """
+    global _x402_client
+    _x402_client = client
+
+
+def _get_x402() -> Any:
+    """Get the x402 client, if configured."""
+    return _x402_client
 
 mcp = FastMCP(
     "Commune",
@@ -108,7 +95,7 @@ def _headers() -> dict[str, str]:
 
 def _handle_402(resp: httpx.Response, method: str, url: str, **kwargs: Any) -> httpx.Response:
     """Handle a 402 Payment Required response using x402 wallet."""
-    x402 = _init_x402()
+    x402 = _get_x402()
     if x402 is None:
         resp.raise_for_status()  # No wallet configured — raise the 402
         return resp  # unreachable, but satisfies type checker
@@ -823,12 +810,11 @@ def main():
         sys.exit(0)
 
     api_key = os.environ.get("COMMUNE_API_KEY", "")
-    wallet_key = os.environ.get("COMMUNE_WALLET_KEY", "")
-    if not api_key and not wallet_key:
+    if not api_key and _x402_client is None:
         print(
-            "Error: Set COMMUNE_API_KEY or COMMUNE_WALLET_KEY.\n"
-            "  export COMMUNE_API_KEY=comm_...        # API key auth\n"
-            "  export COMMUNE_WALLET_KEY=0x...        # x402 wallet auth",
+            "Error: Set COMMUNE_API_KEY or configure an x402 client.\n"
+            "  export COMMUNE_API_KEY=comm_...\n"
+            "  # Or call set_x402_client(client) before main()",
             file=sys.stderr,
         )
         sys.exit(1)
