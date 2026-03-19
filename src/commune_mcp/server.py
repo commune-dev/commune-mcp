@@ -123,6 +123,7 @@ def _handle_402(resp: httpx.Response, method: str, url: str, **kwargs: Any) -> h
     headers = dict(kwargs.pop("headers", {}))
     headers["PAYMENT-SIGNATURE"] = payment_payload
     headers["Content-Type"] = "application/json"
+    kwargs.pop("timeout", None)
     return httpx.request(method, url, headers=headers, timeout=30, **kwargs)
 
 
