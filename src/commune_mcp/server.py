@@ -17,6 +17,17 @@ Configure in Claude Desktop / Cursor / Windsurf:
             }
         }
     }
+
+x402 wallet auth (pay-per-call, no API key needed):
+    {
+        "mcpServers": {
+            "commune": {
+                "command": "uvx",
+                "args": ["commune-mcp"],
+                "env": { "COMMUNE_WALLET_KEY": "0x..." }
+            }
+        }
+    }
 """
 
 from __future__ import annotations
@@ -41,9 +52,40 @@ _api_key_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "commune_api_key", default=os.environ.get("COMMUNE_API_KEY", "")
 )
 
+# x402 wallet key — alternative to API key (pay-per-call with USDC)
+_wallet_key: str = os.environ.get("COMMUNE_WALLET_KEY", "")
+_x402_client: Any = None
+
 BASE_URL = os.environ.get(
     "COMMUNE_BASE_URL", "https://api.commune.email"
 ).rstrip("/")
+
+
+def _init_x402() -> Any:
+    """Lazily initialize the x402 client from COMMUNE_WALLET_KEY."""
+    global _x402_client
+    if _x402_client is not None:
+        return _x402_client
+    if not _wallet_key:
+        return None
+    try:
+        from x402 import x402Client
+        from x402.mechanisms.evm.exact import ExactEvmScheme
+        from eth_account import Account
+
+        key = _wallet_key if _wallet_key.startswith("0x") else f"0x{_wallet_key}"
+        signer = Account.from_key(key)
+        _x402_client = x402Client()
+        _x402_client.register("eip155:*", ExactEvmScheme(signer=signer))
+        return _x402_client
+    except ImportError:
+        print(
+            "Warning: COMMUNE_WALLET_KEY is set but x402 dependencies are missing.\n"
+            "  Install them: pip install x402[evm] eth_account\n"
+            "  Falling back to API key auth (will fail if COMMUNE_API_KEY is not set).",
+            file=sys.stderr,
+        )
+        return None
 
 mcp = FastMCP(
     "Commune",
@@ -57,57 +99,75 @@ mcp = FastMCP(
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
 
 def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {_api_key_ctx.get()}",
-        "Content-Type": "application/json",
-    }
+    api_key = _api_key_ctx.get()
+    h: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        h["Authorization"] = f"Bearer {api_key}"
+    return h
+
+
+def _handle_402(resp: httpx.Response, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Handle a 402 Payment Required response using x402 wallet."""
+    x402 = _init_x402()
+    if x402 is None:
+        resp.raise_for_status()  # No wallet configured — raise the 402
+        return resp  # unreachable, but satisfies type checker
+
+    body = resp.json()
+    accepts = body.get("accepts", [])
+    if not accepts:
+        resp.raise_for_status()
+        return resp
+
+    payment_payload = x402.create_payment_payload(accepts)
+    headers = dict(kwargs.pop("headers", {}))
+    headers["PAYMENT-SIGNATURE"] = payment_payload
+    headers["Content-Type"] = "application/json"
+    return httpx.request(method, url, headers=headers, timeout=30, **kwargs)
+
+
+def _unwrap(resp: httpx.Response) -> Any:
+    """Unwrap response JSON, extracting `data` if present."""
+    resp.raise_for_status()
+    body = resp.json()
+    return body.get("data", body) if isinstance(body, dict) else body
+
+
+def _request(method: str, path: str, **kwargs: Any) -> Any:
+    """Make an HTTP request with automatic x402 payment retry."""
+    url = f"{BASE_URL}{path}"
+    kwargs.setdefault("headers", _headers())
+    kwargs.setdefault("timeout", 30)
+    resp = httpx.request(method, url, **kwargs)
+    if resp.status_code == 402:
+        resp = _handle_402(resp, method, url, **kwargs)
+    return _unwrap(resp)
 
 
 def _get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     """GET request to the Commune v1 API."""
     clean = {k: v for k, v in (params or {}).items() if v is not None}
-    resp = httpx.get(
-        f"{BASE_URL}{path}", headers=_headers(), params=clean or None, timeout=30
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data", body) if isinstance(body, dict) else body
+    return _request("GET", path, params=clean or None)
 
 
 def _post(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     """POST request to the Commune v1 API."""
-    resp = httpx.post(
-        f"{BASE_URL}{path}", headers=_headers(), json=payload, timeout=30
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data", body) if isinstance(body, dict) else body
+    return _request("POST", path, json=payload)
 
 
 def _put(path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     """PUT request to the Commune v1 API."""
-    resp = httpx.put(
-        f"{BASE_URL}{path}", headers=_headers(), json=payload, timeout=30
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data", body) if isinstance(body, dict) else body
+    return _request("PUT", path, json=payload)
 
 
 def _delete(path: str) -> Any:
     """DELETE request to the Commune v1 API."""
-    resp = httpx.delete(f"{BASE_URL}{path}", headers=_headers(), timeout=30)
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data", body) if isinstance(body, dict) else body
+    return _request("DELETE", path)
 
 
 def _delete_with_body(path: str, payload: dict[str, Any]) -> Any:
     """DELETE request with JSON body to the Commune v1 API."""
-    resp = httpx.request("DELETE", f"{BASE_URL}{path}", headers=_headers(), json=payload, timeout=30)
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data", body) if isinstance(body, dict) else body
+    return _request("DELETE", path, json=payload)
 
 
 def _fmt(data: Any) -> str:
@@ -323,15 +383,8 @@ def list_threads(
     if cursor:
         params["cursor"] = cursor
 
-    # Thread endpoint returns {data, next_cursor, has_more} — return full body
-    resp = httpx.get(
-        f"{BASE_URL}/v1/threads",
-        headers=_headers(),
-        params=params,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return _fmt(resp.json())
+    # Thread endpoint returns {data, next_cursor, has_more} — return full envelope
+    return _fmt(_request("GET", "/v1/threads", params=params))
 
 
 @mcp.tool()
@@ -769,15 +822,18 @@ def main():
         sys.exit(0)
 
     api_key = os.environ.get("COMMUNE_API_KEY", "")
-    if not api_key:
+    wallet_key = os.environ.get("COMMUNE_WALLET_KEY", "")
+    if not api_key and not wallet_key:
         print(
-            "Error: Set the COMMUNE_API_KEY environment variable.\n"
-            "  export COMMUNE_API_KEY=comm_...",
+            "Error: Set COMMUNE_API_KEY or COMMUNE_WALLET_KEY.\n"
+            "  export COMMUNE_API_KEY=comm_...        # API key auth\n"
+            "  export COMMUNE_WALLET_KEY=0x...        # x402 wallet auth",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    _api_key_ctx.set(api_key)
+    if api_key:
+        _api_key_ctx.set(api_key)
     mcp.run()
 
 
